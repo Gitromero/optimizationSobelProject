@@ -1,0 +1,14 @@
+# Compiled binaries
+video_driver
+video_driver_*
+!video_driver.cpp
+!video_driver.hpp
+*.o
+*.out
+
+# Generated run artifacts (output2/ is the kept results set)
+captures/
+outputs/
+
+# Images
+*.png

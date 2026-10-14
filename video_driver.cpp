@@ -1,17 +1,22 @@
 /************************
  * File: video_driver.cpp
  *
- * Description: This file is the Lab 4 driver. It loads the test frames, builds every test
- *          resolution, runs each experiment under the same measurement procedure, verifies
- *          outputs, saves image captures, and prints markdown tables to stdout (the Makefile
- *          tees stdout into outputs/).
+ * Description: This file is the Lab 4 / Lab 5 driver. It loads the test frames, builds every
+ *          test resolution, runs each experiment under the same measurement procedure,
+ *          verifies outputs, saves image captures, and prints markdown tables to stdout (the
+ *          Makefile tees stdout into outputs/).
  *
  *          Usage: ./video_driver <part1|part2|part3|part4|part5> [video]
+ *                 ./video_driver lab5 <video> <current|lab2>
  *              part1 - baseline full-frame pipeline (cv::Mat::at)
  *              part2 - row-major vs. column-major traversal (no video needed)
  *              part3 - .at() vs. row-pointer pixel access
  *              part4 - data-movement analysis of the baseline pipeline
  *              part5 - three-row streaming pipeline + Part 6 measurements
+ *              lab5  - Lab 5 compiler-optimization measurement of one implementation:
+ *                      current = Lab 4 full-frame row-pointer pipeline
+ *                      lab2    = Lab 2 baseline grayscale()/sobel() (grayscale_lab3/sobel_lab3)
+ *                      The Makefile builds one binary per set of compiler flags.
  *
  *          Measured region: only the grayscale and Sobel function calls. Video decode,
  *          resizing, buffer allocation, image comparison, and PNG writes are all outside it.
@@ -35,7 +40,7 @@
 #include "video_driver.hpp"
 #include "memory_pipelines.hpp"
 #include "compare.hpp"
-#include "lab3_reference.hpp"
+#include "optimizations.hpp"
 #include "traversal.hpp"
 #include "cache_info.hpp"
 
@@ -64,16 +69,19 @@ struct FrameSet {
 enum PipelineId {
     PIPE_AT = 0,        // full gray frame, cv::Mat::at()
     PIPE_PTR = 1,       // full gray frame, row pointers
-    PIPE_STREAM = 2     // three gray rows, row pointers
+    PIPE_STREAM = 2,    // three gray rows, row pointers
+    PIPE_LAB2 = 3       // Lab 2 baseline: 3-channel gray copy, new Sobel frame per call
 };
 
-static const char* PIPELINE_NAMES[] = {"Baseline (.at)", "Full-frame (ptr)", "Streaming (3 rows)"};
+static const char* PIPELINE_NAMES[] = {"Baseline (.at)", "Full-frame (ptr)", "Streaming (3 rows)",
+                                       "Lab 2 baseline"};
 
 // every preallocated buffer used by the three pipelines at one resolution
 struct PipelineBuffers {
     cv::Mat gray_at, sobel_at;
     cv::Mat gray_ptr, sobel_ptr;
     cv::Mat row_buffers, sobel_stream;
+    cv::Mat gray_lab2, sobel_lab2;      // CV_8UC3, Lab 2 baseline (Lab 5 only)
 };
 
 // per-frame timings of one pipeline (gray/sobel are empty for the fused streaming pipeline)
@@ -244,6 +252,9 @@ static void allocate_buffers(PipelineBuffers* buffers, int width, int height){
     buffers->sobel_ptr.create(height, width, CV_8UC1);
     buffers->row_buffers.create(3, width, CV_8UC1);
     buffers->sobel_stream.create(height, width, CV_8UC1);
+    // grayscale_lab3() copies into this with copyTo(), which reuses it when size/type match;
+    // sobel_lab3() always allocates its own output frame (that is part of the Lab 2 code)
+    buffers->gray_lab2.create(height, width, CV_8UC3);
 }
 
 /******************************
@@ -276,6 +287,15 @@ static void run_pipeline_timed(int id, cv::Mat* rgb_frame, PipelineBuffers* buff
         t1 = now_ms();
         sobel_ptr(&buffers->gray_ptr, &buffers->sobel_ptr);
         t2 = now_ms();
+    } else if(id == PIPE_LAB2){
+        t0 = now_ms();
+        grayscale_lab3(rgb_frame, &buffers->gray_lab2);
+        t1 = now_ms();
+        cv::Mat* sobel_frame = sobel_lab3(&buffers->gray_lab2);
+        t2 = now_ms();
+        // keep the result for verification; freeing the Lab 2 frame is outside the timed region
+        buffers->sobel_lab2 = *sobel_frame;
+        delete sobel_frame;
     } else {
         t0 = now_ms();
         sobel_streaming(rgb_frame, &buffers->row_buffers, &buffers->sobel_stream);
@@ -334,7 +354,7 @@ static void benchmark_pipelines(FrameSet* set, PipelineBuffers* buffers, const i
  *
  ******************************/
 static void print_measurement_region(){
-    std::cout << "Build: -O0, single thread, no SIMD intrinsics\n";
+    std::cout << "Build: " << BUILD_FLAGS << ", single thread, no SIMD intrinsics\n";
     std::cout << "Timed region: grayscale + Sobel calls only (std::chrono::steady_clock). "
                  "Excluded: video decode, resize, buffer allocation, comparisons, PNG writes.\n";
     std::cout << "Samples: " << BENCH_FRAMES << " frames x " << BENCH_REPEATS
@@ -792,17 +812,223 @@ static int run_part5(std::vector<FrameSet>* sets){
     return all_identical ? 1 : 0;
 }
 
+/*==========================================================================================
+ * Lab 5: compiler optimization
+ *========================================================================================*/
+
+/******************************
+ * Function: run_lab5
+ *
+ * Description: This function benchmarks one implementation over the Lab 5 window and prints
+ *  its grayscale, Sobel, and total time at every resolution. The same source is built once
+ *  per set of compiler flags (see the Makefile), so the build flags are the only thing that
+ *  changes between runs of the current implementation.
+ *
+ *  Measurement: the video is played once from its first frame, and every frame up to the
+ *  LAB5_END_SECONDS time mark is processed once. Each frame is decoded, scaled into the
+ *  preallocated buffer of every resolution (untimed), and run through the pipeline at each
+ *  resolution (timed); then the next frame is read. Only one frame is held in memory. One
+ *  untimed warmup on the first frame per resolution; the median per-frame time is reported.
+ *  (Lab 4 preloaded all frames instead; see the LAB5_END_SECONDS note in video_driver.hpp.)
+ *
+ *  Correctness: the -O0 build of the current implementation saves the reference captures
+ *  (captures/lab5_O0_current_*.png) of the last frame of the window. Every other run compares
+ *  its last frame against them, so a compiler flag that changed the output would show up
+ *  here. The Lab 2 baseline writes three-channel frames and leaves gray values in the Sobel
+ *  border, so it is compared on channel 0, with the Sobel border excluded. Differences are
+ *  reported, not treated as a failure: the source is the same in every build, so a
+ *  difference is a measured effect of the compiler (e.g. -O3 contracting the double
+ *  grayscale math into fused multiply-adds).
+ *
+ * param video_file: path to the input video
+ * param impl: "current" (Lab 4 row-pointer pipeline) or "lab2" (Lab 2 baseline)
+ *
+ * return: int, 1 if the run completed and every comparison could be made, 0 otherwise
+ *
+ ******************************/
+static int run_lab5(const char* video_file, const std::string& impl){
+    bool lab2 = (impl == "lab2");
+    int id = lab2 ? PIPE_LAB2 : PIPE_PTR;
+    std::string tag = std::string(BUILD_TAG) + "_" + impl;
+    bool is_reference = (!lab2 && std::string(BUILD_TAG) == "O0");
+    int n_res = sizeof(RESOLUTIONS) / sizeof(RESOLUTIONS[0]);
+
+    cv::VideoCapture cap(video_file);
+    if(!cap.isOpened()){
+        std::cout << "Error: couldn't open file: " << video_file << std::endl;
+        return 0;
+    }
+    double fps = cap.get(cv::CAP_PROP_FPS);
+    int n_frames = (int)(LAB5_END_SECONDS * fps + 0.5);
+    int last_frame = n_frames - 1;
+
+    std::cout << "==================================================================\n";
+    std::cout << "Lab 5: Compiler Optimization (" << BUILD_FLAGS << ", "
+              << (lab2 ? "Lab 2 baseline" : "current implementation") << ")\n";
+    std::cout << "==================================================================\n";
+    std::cout << std::fixed << std::setprecision(2)
+              << "Input: " << video_file << ", played once from the start to the "
+              << LAB5_END_SECONDS << " s mark: frames 0-" << last_frame << " (" << n_frames
+              << " frames at " << fps << " fps), scaled with cv::resize(INTER_AREA) outside the timed region\n";
+    std::cout << "Build: " << BUILD_FLAGS << ", single thread, no SIMD intrinsics\n";
+    std::cout << "Timed region: grayscale + Sobel calls only (std::chrono::steady_clock). "
+                 "Excluded: video decode, resize, buffer allocation, comparisons, PNG writes.\n";
+    std::cout << "Samples: " << n_frames << " frames x 1 pass per resolution (+1 untimed warmup); "
+              << "one frame decoded at a time, outside the timed region; median per-frame time reported.\n";
+    std::cout << "Time per pixel = median frame time / (width * height).\n\n";
+    if(lab2){
+        std::cout << "Implementation: Lab 2 baseline grayscale()/sobel() (grayscale_lab3 / sobel_lab3, "
+                     "Gy col_idx fix): cv::Mat::at<cv::Vec3b>, 3-channel gray copy, new Sobel frame per call\n\n";
+    } else {
+        std::cout << "Implementation: Lab 4 full-frame row-pointer pipeline (grayscale_ptr / sobel_ptr): "
+                     "single-channel gray frame, row pointers, row-major\n\n";
+    }
+
+    // every buffer, including each resolution's scaled-frame buffer, is allocated once here
+    std::vector<PipelineBuffers> buffers(n_res);
+    std::vector<PipelineTimes> times(n_res);
+    std::vector<cv::Mat> scaled(n_res);
+    for(int r = 0; r < n_res; r++){
+        allocate_buffers(&buffers[r], RESOLUTIONS[r].width, RESOLUTIONS[r].height);
+        scaled[r].create(RESOLUTIONS[r].height, RESOLUTIONS[r].width, CV_8UC3);
+    }
+
+    // play the video once: decode a frame, scale it (untimed), time it at every resolution
+    cv::Mat frame;
+    double decode_ms = 0, bench_start = now_ms();
+    for(int f = 0; f < n_frames; f++){
+        double d0 = now_ms();
+        if(!cap.read(frame)){
+            std::cout << "Error: video ended before frame " << last_frame << std::endl;
+            return 0;
+        }
+        for(int r = 0; r < n_res; r++){
+            // native resolution is copied so the next read() can't change it mid-run
+            if(frame.cols == RESOLUTIONS[r].width && frame.rows == RESOLUTIONS[r].height){frame.copyTo(scaled[r]);}
+            else{cv::resize(frame, scaled[r], scaled[r].size(), 0, 0, cv::INTER_AREA);}
+        }
+        decode_ms += now_ms() - d0;
+
+        for(int r = 0; r < n_res; r++){
+            if(f == 0){run_pipeline_timed(id, &scaled[r], &buffers[r], nullptr);}   // warmup
+            run_pipeline_timed(id, &scaled[r], &buffers[r], &times[r]);
+        }
+
+        // progress goes to stderr so it shows while running but is not saved to the outputs
+        if((f + 1) % 60 == 0 || f + 1 == n_frames){
+            std::cerr << "  " << tag << ": " << f + 1 << "/" << n_frames << " frames, "
+                      << std::fixed << std::setprecision(0) << (now_ms() - bench_start) / 1000.0 << " s\n";
+        }
+    }
+    cap.release();
+
+    std::cout << "| Resolution | Pixels | Gray ms/frame | Sobel ms/frame | Total ms/frame | ns/pixel | FPS |\n";
+    std::cout << "|------------|--------|---------------|----------------|----------------|----------|-----|\n";
+
+    bool all_identical = true;
+    bool all_compared = true;
+    std::vector<std::string> verify_rows, saved;
+
+    for(int r = 0; r < n_res; r++){
+        int width = RESOLUTIONS[r].width, height = RESOLUTIONS[r].height;
+        double pixels = (double)width * height;
+        std::string res = res_name(width, height);
+
+        double total = median(times[r].total_ms);
+        std::cout << std::fixed << std::setprecision(3)
+                  << "| " << res
+                  << " | " << (long)pixels
+                  << " | " << median(times[r].gray_ms)
+                  << " | " << median(times[r].sobel_ms)
+                  << " | " << total
+                  << " | " << total * 1e6 / pixels
+                  << " | " << std::setprecision(2) << 1000.0 / total << " |\n";
+
+        // outputs of the last frame of the window (outside the timed region)
+        run_pipeline_timed(id, &scaled[r], &buffers[r], nullptr);
+        cv::Mat gray, sobel;
+        if(lab2){
+            cv::extractChannel(buffers[r].gray_lab2, gray, 0);
+            cv::extractChannel(buffers[r].sobel_lab2, sobel, 0);
+        } else {
+            gray = buffers[r].gray_ptr;
+            sobel = buffers[r].sobel_ptr;
+        }
+
+        std::string gray_path = capture_path("lab5", (tag + "_gray").c_str(), width, height);
+        std::string sobel_path = capture_path("lab5", (tag + "_sobel").c_str(), width, height);
+        cv::imwrite(gray_path, gray);
+        cv::imwrite(sobel_path, sobel);
+        saved.push_back(gray_path);
+        saved.push_back(sobel_path);
+
+        if(is_reference){
+            verify_rows.push_back("| " + res + " | Gray + Sobel saved as the -O0 reference | - | - | - |");
+            continue;
+        }
+
+        // compare against the -O0 reference captures
+        std::string ref_gray_path = capture_path("lab5", "O0_current_gray", width, height);
+        std::string ref_sobel_path = capture_path("lab5", "O0_current_sobel", width, height);
+        cv::Mat ref_gray = cv::imread(ref_gray_path, cv::IMREAD_UNCHANGED);
+        cv::Mat ref_sobel = cv::imread(ref_sobel_path, cv::IMREAD_UNCHANGED);
+        if(ref_gray.empty() || ref_sobel.empty()){
+            verify_rows.push_back("| " + res + " | -O0 reference | capture missing (run the -O0 build first) | | |");
+            all_compared = false;
+            continue;
+        }
+
+        cv::Mat sobel_cmp = sobel, ref_sobel_cmp = ref_sobel;
+        if(lab2){
+            cv::Rect interior(1, 1, width - 2, height - 2);
+            sobel_cmp = sobel(interior);
+            ref_sobel_cmp = ref_sobel(interior);
+        }
+
+        ImageDiff gray_diff = compare_images(&ref_gray, &gray);
+        ImageDiff sobel_diff = compare_images(&ref_sobel_cmp, &sobel_cmp);
+        verify_rows.push_back("| " + res + " | Grayscale vs " + ref_gray_path + " " + diff_string(&gray_diff));
+        verify_rows.push_back("| " + res + " | Sobel" + (lab2 ? " (interior)" : "") + " vs " +
+                              ref_sobel_path + " " + diff_string(&sobel_diff));
+
+        if(!gray_diff.identical || !sobel_diff.identical){all_identical = false;}
+    }
+
+    std::cout << "\nCorrectness (frame " << last_frame << ", vs. the -O0 build of the current implementation"
+              << (lab2 ? ", channel 0" : "") << "):\n";
+    std::cout << "| Resolution | Comparison | Differing pixels | Max abs diff | Bit-identical |\n";
+    std::cout << "|------------|------------|------------------|--------------|---------------|\n";
+    for(std::string& row : verify_rows){std::cout << row << "\n";}
+
+    std::cout << "\nSaved images from frame " << last_frame << ":\n";
+    for(std::string& path : saved){std::cout << "  " << path << "\n";}
+
+    std::cout << "\nAll outputs bit-identical: " << (is_reference ? "n/a (this run is the reference)"
+                                                 : (!all_compared ? "NO (reference missing)"
+                                                 : (all_identical ? "yes" : "NO"))) << "\n";
+    if(all_compared && !all_identical){
+        std::cout << "Note: every build compiles the same source, so these differences come from the "
+                     "compiler's code generation, not from the implementation.\n";
+    }
+
+    std::cout << std::fixed << std::setprecision(1)
+              << "Decoding + scaling (untimed): " << decode_ms / 1000.0 << " s\n";
+    return all_compared ? 1 : 0;
+}
+
 /******************************
  * Function: main
  *
- * Description: selects the experiment, loads frames when needed, runs the experiment
+ * Description: selects the experiment, loads frames when needed (Lab 5 streams its own),
+ *  runs the experiment
  *
  * return: int, 0 on success, 1 on failure
 
 ******************************/
 int main(int argc, char *argv[]){
-    if(argc < 2 || argc > 3){
-        std::cout << "Usage: " << argv[0] << " <part1|part2|part3|part4|part5> [video]" << std::endl;
+    if(argc < 2 || argc > 4){
+        std::cout << "Usage: " << argv[0] << " <part1|part2|part3|part4|part5> [video]\n"
+                  << "       " << argv[0] << " lab5 <video> <current|lab2>" << std::endl;
         return 1;
     }
 
@@ -811,16 +1037,30 @@ int main(int argc, char *argv[]){
     if(part == "part2"){return run_traversal_experiment() ? 0 : 1;}
     if(part == "part4"){return run_part4() ? 0 : 1;}
 
-    if(part != "part1" && part != "part3" && part != "part5"){
+    if(part != "part1" && part != "part3" && part != "part5" && part != "lab5"){
         std::cout << "Unknown part: " << part << std::endl;
         return 1;
     }
-    if(argc != 3){
+    if(part == "lab5"){
+        if(argc != 4 || (std::string(argv[3]) != "current" && std::string(argv[3]) != "lab2")){
+            std::cout << "Usage: " << argv[0] << " lab5 <video> <current|lab2>" << std::endl;
+            return 1;
+        }
+    } else if(argc != 3){
         std::cout << "Usage: " << argv[0] << " " << part << " <video>" << std::endl;
         return 1;
     }
 
     std::filesystem::create_directories(CAPTURE_DIR);
+
+    // Lab 5 streams the video itself instead of preloading BENCH_FRAMES frames
+    if(part == "lab5"){
+        double lab5_start = now_ms();
+        int lab5_ok = run_lab5(argv[2], argv[3]);
+        std::cout << std::fixed << std::setprecision(1)
+                  << "\nRun time: " << (now_ms() - lab5_start) / 1000.0 << " s total\n";
+        return lab5_ok ? 0 : 1;
+    }
 
     // wall-clock time of the whole run (decode + scaling + benchmarks + verification + PNGs)
     double run_start = now_ms();

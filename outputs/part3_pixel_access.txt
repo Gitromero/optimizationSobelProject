@@ -1,0 +1,66 @@
+Input: ../bbb_sunflower_2160p_60fps_normal.mp4 (3840x2160), frames 60-179 (120 frames = 2.00 s of video at 60.00 fps), scaled with cv::resize(INTER_AREA) before timing
+==================================================================
+Part 3: Pixel-Access Experiment (cv::Mat::at vs. row pointers)
+==================================================================
+Build: -O0, single thread, no SIMD intrinsics
+Timed region: grayscale + Sobel calls only (std::chrono::steady_clock). Excluded: video decode, resize, buffer allocation, comparisons, PNG writes.
+Samples: 120 frames x 3 repeats per implementation (+1 untimed warmup); median per-frame time reported.
+Time per pixel = median frame time / (width * height).
+
+Sobel stage only (same gray input, same traversal order):
+| Resolution | Pixel-access method | Execution time (ms/frame) | Time per pixel (ns) | Relative performance |
+|------------|---------------------|---------------------------|---------------------|----------------------|
+| 320x180 | cv::Mat::at() | 3.372 | 58.538 | 1.00x |
+| 320x180 | Row pointers  | 2.330 | 40.454 | 1.45x |
+| 640x360 | cv::Mat::at() | 13.543 | 58.780 | 1.00x |
+| 640x360 | Row pointers  | 9.345 | 40.562 | 1.45x |
+| 1280x720 | cv::Mat::at() | 54.346 | 58.969 | 1.00x |
+| 1280x720 | Row pointers  | 37.496 | 40.686 | 1.45x |
+| 1920x1080 | cv::Mat::at() | 122.317 | 58.988 | 1.00x |
+| 1920x1080 | Row pointers  | 84.479 | 40.740 | 1.45x |
+| 3840x2160 | cv::Mat::at() | 489.830 | 59.055 | 1.00x |
+| 3840x2160 | Row pointers  | 338.040 | 40.755 | 1.45x |
+
+Grayscale stage and full pipeline (ms/frame):
+| Resolution | Gray .at | Gray ptr | Gray speedup | Total .at | Total ptr | Total speedup |
+|------------|----------|----------|--------------|-----------|-----------|---------------|
+| 320x180 | 0.735 | 0.351 | 2.10x | 4.106 | 2.682 | 1.53x |
+| 640x360 | 2.936 | 1.400 | 2.10x | 16.489 | 10.745 | 1.53x |
+| 1280x720 | 11.744 | 5.587 | 2.10x | 66.155 | 43.102 | 1.53x |
+| 1920x1080 | 26.469 | 12.570 | 2.11x | 148.884 | 97.076 | 1.53x |
+| 3840x2160 | 105.986 | 50.324 | 2.11x | 595.891 | 388.417 | 1.53x |
+
+Correctness (.at output vs. row-pointer output):
+| Resolution | Comparison | Differing pixels | Max abs diff | Bit-identical |
+|------------|------------|------------------|--------------|---------------|
+| 320x180 | Grayscale, 120 frames | 0 | 0 | yes |
+| 320x180 | Sobel, 120 frames | 0 | 0 | yes |
+| 320x180 | Sobel ptr vs captures/part1_baseline_sobel_320x180.png | 0 | 0 | yes |
+| 640x360 | Grayscale, 120 frames | 0 | 0 | yes |
+| 640x360 | Sobel, 120 frames | 0 | 0 | yes |
+| 640x360 | Sobel ptr vs captures/part1_baseline_sobel_640x360.png | 0 | 0 | yes |
+| 1280x720 | Grayscale, 120 frames | 0 | 0 | yes |
+| 1280x720 | Sobel, 120 frames | 0 | 0 | yes |
+| 1280x720 | Sobel ptr vs captures/part1_baseline_sobel_1280x720.png | 0 | 0 | yes |
+| 1920x1080 | Grayscale, 120 frames | 0 | 0 | yes |
+| 1920x1080 | Sobel, 120 frames | 0 | 0 | yes |
+| 1920x1080 | Sobel ptr vs captures/part1_baseline_sobel_1920x1080.png | 0 | 0 | yes |
+| 3840x2160 | Grayscale, 120 frames | 0 | 0 | yes |
+| 3840x2160 | Sobel, 120 frames | 0 | 0 | yes |
+| 3840x2160 | Sobel ptr vs captures/part1_baseline_sobel_3840x2160.png | 0 | 0 | yes |
+
+Saved comparison images from frame 179:
+  captures/part3_sobel_at_320x180.png
+  captures/part3_sobel_ptr_320x180.png
+  captures/part3_sobel_at_640x360.png
+  captures/part3_sobel_ptr_640x360.png
+  captures/part3_sobel_at_1280x720.png
+  captures/part3_sobel_ptr_1280x720.png
+  captures/part3_sobel_at_1920x1080.png
+  captures/part3_sobel_ptr_1920x1080.png
+  captures/part3_sobel_at_3840x2160.png
+  captures/part3_sobel_ptr_3840x2160.png
+
+All outputs bit-identical: yes
+
+Run time: 678.8 s total (4.8 s decoding + scaling 120 frames, 674.0 s benchmarking, verifying, and saving captures)

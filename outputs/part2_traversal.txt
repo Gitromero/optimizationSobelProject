@@ -1,0 +1,17 @@
+==================================================================
+Part 2: Memory Traversal Experiment (row-major vs. column-major)
+==================================================================
+Cache hierarchy (cpu0): L1d 32.0 KiB, L2 256.0 KiB, L3 8.0 MiB, line 64 B
+Element type: int32_t (4 B). Operation per element: checksum += element
+Each trial sweeps the array ceil(67108864 / elements) times; median of 5 trials reported.
+
+| Class  | Dimensions     | Elements    | Array size  | Fits in | Col stride | Passes | Row-major ms | Col-major ms | Row ns/elem | Col ns/elem | Row-major speedup | Checksum (both) | Match |
+|--------|----------------|-------------|-------------|---------|------------|--------|--------------|--------------|-------------|-------------|-------------------|-----------------|-------|
+| small  | 64 x 64        |        4096 |    16.0 KiB |      L1 |      256 B |  16384 |       129.80 |       125.69 |       1.934 |       1.873 |             0.97x |          522240 |   yes |
+| small  | 256 x 256      |       65536 |   256.0 KiB |      L2 |     1024 B |   1024 |       134.89 |       155.35 |       2.010 |       2.315 |             1.15x |         8355840 |   yes |
+| medium | 1024 x 1024    |     1048576 |     4.0 MiB |      L3 |     4096 B |     64 |       134.78 |       190.42 |       2.008 |       2.837 |             1.41x |       133693440 |   yes |
+| medium | 4096 x 4096    |    16777216 |    64.0 MiB |    DRAM |    16384 B |      4 |       139.21 |       741.27 |       2.074 |      11.046 |             5.32x |      2139095040 |   yes |
+| large  | 100000 x 1024  |   102400000 |   390.6 MiB |    DRAM |     4096 B |      1 |       211.38 |      1058.09 |       2.064 |      10.333 |             5.01x |     13056000000 |   yes |
+
+Row-major speedup = column-major time / row-major time (>1 means row-major is faster).
+All checksums match: yes

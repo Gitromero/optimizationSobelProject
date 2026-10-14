@@ -1,0 +1,367 @@
+==================================================================
+Lab 5 Study Guide: Compiler Optimization on the Raspberry Pi 5
+==================================================================
+Purpose: background, the key numbers, and question-by-question notes for the Lab 5
+deliverables. Every number here comes from the files in outputs/ (main resolution
+1920x1080, 120 frames x 3 repeats, median ms/frame). Where a claim comes from the assembly or
+from GCC's own reports, the file is named so you can cite it.
+
+Contents
+  1. What was measured and how
+  2. Concepts you need
+  3. Results at a glance (with derived numbers)
+  4. Deliverable questions: answer notes
+  5. Caveats and things NOT measured
+  6. Map of the output files / how to regenerate
+
+
+==================================================================
+1. What was measured and how
+==================================================================
+Machine:   Raspberry Pi 5, Broadcom BCM2712, 4 x Cortex-A76 @ 2.4 GHz (AArch64 / ARMv8.2-A)
+           L1d 64 KiB, L2 512 KiB (per core), L3 2 MiB (shared), 16 GB RAM
+Compiler:  g++ (Debian 14.2.0-19) 14.2.0, -std=c++17
+Threads:   1 (nothing in the code or flags creates threads)
+Input:     ../bbb_sunflower_2160p_60fps_normal.mp4, frames 60-179, scaled to 5 resolutions
+Timing:    std::chrono::steady_clock around the grayscale call and the Sobel call only.
+           Excluded: decode, resize, buffer allocation, comparisons, PNG writes.
+           1 untimed warmup, then 120 frames x 3 repeats; the median frame is reported.
+
+The two implementations
+-----------------------
+"Current" = Lab 4 full-frame row-pointer pipeline (memory_pipelines.cpp):
+    grayscale_ptr -> grayscale_row_ptr    one-channel (CV_8UC1) gray output
+    sobel_ptr     -> sobel_row_ptr        Gx and Gy in the same 3x3 pass, row pointers
+    Chosen because it is the fastest Lab 4 version that times grayscale and Sobel
+    separately. The Lab 4 streaming pipeline fuses the two stages, so it can't be split,
+    and it ran at the same speed in Lab 4.
+"Lab 2 baseline" = grayscale_lab3 / sobel_lab3 (optimizations.cpp): the original
+    grayscale()/sobel() from the first commit's video_driver.cpp, with one bug fixed
+    (the Gy loop never reset col_idx and read past the end of Gy). Characteristics:
+    - cv::Mat::at<cv::Vec3b> for every pixel access
+    - grayscale copies the whole RGB frame first (copyTo), then writes the gray value
+      into all 3 channels
+    - sobel allocates a new Mat and copies the whole gray frame into it on every call
+    - Gx and Gy are two separate 3x3 passes (18 .at() reads per output pixel)
+    - conv_helper_lab3() is a separate function called per pixel
+
+The four builds of the same source (Makefile, LAB5_FLAGS_*)
+-----------------------------------------------------------
+    O0          -O0
+    O3_novec    -O3 -fno-tree-loop-vectorize -fno-tree-slp-vectorize
+    O3          -O3
+    O3_native   -O3 -march=native
+The Lab 2 baseline run uses the same O3 binary with "lab2" selected at run time.
+
+
+==================================================================
+2. Concepts you need
+==================================================================
+-O0
+    No optimization. Every variable lives in memory (the stack). Each source statement
+    becomes its own isolated block of instructions, and every call stays a call. That
+    makes it easy to map source to assembly, and it is very slow.
+
+-O3
+    All the general optimizations: register allocation, inlining, constant folding,
+    common-subexpression elimination, loop-invariant code motion, strength reduction,
+    unrolling, instruction scheduling, if-conversion (branches -> csel), plus automatic
+    vectorization.
+
+-fno-tree-loop-vectorize / -fno-tree-slp-vectorize
+    GCC has two vectorizers:
+    - loop vectorizer: runs several iterations of a loop at once in one SIMD register
+    - SLP (superword-level parallelism): packs independent similar operations in straight-line
+      code into SIMD
+    Turning off both removes automatic SIMD and leaves everything else at -O3. That is what
+    lets Part 1 separate "general optimization" from "SIMD".
+
+NEON / Advanced SIMD (the Pi's SIMD)
+    Not SSE/AVX; this is ARM. 32 registers v0-v31, 128 bits each. The lane layout is in the
+    suffix:
+        .16b = 16 x 8-bit   .8h = 8 x 16-bit   .4s = 4 x 32-bit   .2d = 2 x 64-bit (double)
+    Signs of vectorized code: ld3/st3 (load and de-interleave RGB), fmla v.2d, umin v.8h,
+    zip/uzp (widen/narrow), str q22 (store 16 bytes). Scalar code uses w/x (integer) and d/s
+    (float) registers.
+
+-march=native
+    "Generate code for exactly this CPU." On the Pi, GCC's default target is ARMv8.0-A
+    (.arch armv8-a: runs on any 64-bit ARM, Pi 3/4/5). Native becomes
+    armv8.2-a+dotprod+crc+crypto+fp16+rcpc. That allows newer instructions (e.g. sdot/udot,
+    fp16 arithmetic) and Cortex-A76 scheduling. It does not force them; the compiler uses
+    them only where they fit.
+
+Floating-point contraction (FMA)
+    a*b + c computed as one fused multiply-add (fmadd/fmla) rounds once instead of twice.
+    GCC does this at -O3 by default (-ffp-contract=fast); -O0 does not. The result can
+    differ in the last bit, which explains the few-pixel differences in this lab (section 5).
+
+Aliasing (why compilers are sometimes "unwilling")
+    The compiler may only transform code if it can prove the result is the same for every
+    legal input. A store through a char-type pointer (uint8_t*) is allowed to modify ANY
+    object, so after such a store the compiler must assume globals, Mat fields, and so on
+    may have changed. This blocks several optimizations here (sections 4.2 and 4.5).
+
+
+==================================================================
+3. Results at a glance (1920x1080, ms/frame)
+==================================================================
+| Build | Source | Gray | Sobel | Total | vs -O0 | vs Lab 2 -O3 |
+|-------|--------|------|-------|-------|--------|--------------|
+| -O0 | Current | 27.297 | 173.547 | 200.753 | 1.00x | 0.24x |
+| -O3 no-vec | Current | 5.526 | 20.116 | 25.642 | 7.83x | 1.91x |
+| -O3 | Current | 3.488 | 20.116 | 23.604 | 8.51x | 2.08x |
+| -O3 -march=native | Current | 3.614 | 20.065 | 23.680 | 8.48x | 2.07x |
+| -O3 | Lab 2 baseline | 11.470 | 37.552 | 48.996 | 4.10x | 1.00x |
+
+Per-stage speedups (derived)
+| Step | Grayscale | Sobel | Total |
+|------|-----------|-------|-------|
+| -O0 -> -O3 no-vec (general optimization) | 4.94x | 8.63x | 7.83x |
+| -O3 no-vec -> -O3 (SIMD) | 1.58x | 1.00x | 1.09x |
+| -O3 -> -O3 -march=native | 0.97x | 1.00x | 1.00x |
+| Lab 2 -O3 -> Current -O3 (source quality) | 3.29x | 1.87x | 2.08x |
+
+Cycles per pixel (time per pixel x 2.4 GHz)
+| Build | Gray cyc/px | Sobel cyc/px |
+|-------|-------------|--------------|
+| -O0 | ~31.6 | ~200.9 |
+| -O3 no-vec | ~6.4 | ~23.3 |
+| -O3 | ~4.0 | ~23.3 |
+| Lab 2, -O3 | ~13.3 | ~43.5 |
+
+Share of time: Sobel is 86% of the total at -O0 and 85% at -O3, so it dominates every result.
+
+Scaling across resolutions (see the per-part files): -O3 total time per pixel is 11.34-11.41
+ns from 320x180 (fits in L1) to 3840x2160 (32 MB of buffers, far beyond the 2 MB L3). The
+pipeline is compute-bound, not memory-bound. Cache size does not limit these results, which
+matches the Lab 4 streaming result (no gain from smaller buffers).
+
+
+==================================================================
+4. Deliverable questions: answer notes
+==================================================================
+These are the facts and evidence for each answer. Write the answers in your own words.
+
+------------------------------------------------------------------
+4.1 Compiler Optimization Results
+------------------------------------------------------------------
+Q: How much performance does -O3 recover vs -O0 with SIMD disabled?
+   - 7.83x total (200.753 -> 25.642 ms). This is about 99% of the full -O3 time saved:
+     (200.753-25.642)/(200.753-23.604) = 175.1/177.1 ms.
+   - The ratio is the same at every resolution (7.80x-7.83x), so it does not depend on
+     image size.
+   - Is it surprising? -O0 is far worse than "unoptimized-but-reasonable" code. Every
+     variable round-trips through the stack, so the Sobel loop runs ~511 instructions per
+     pixel versus 60 at -O3 (part_2_MC_register_allocation.txt).
+
+Q: Are grayscale and Sobel affected equally? Why not?
+   - No: Sobel 8.63x, grayscale 4.94x.
+   - Sobel has far more for the compiler to remove. Its 3x3 double loop has 9 taps x 3
+     addresses each, and at -O0 every address is recomputed from stack variables (28 of 48
+     instructions per tap are address math). The loop control runs 12 times per pixel, and
+     there are 3 function calls per pixel (gradient_magnitude, std::sqrt<int>, libm sqrt).
+     -O3 removes nearly all of that: full unroll, constant offsets, inlining with a
+     single-instruction fsqrt.
+   - Grayscale is already a simple loop (3 loads, 3 multiplies, 1 store), so there is less
+     overhead to remove. Its remaining cost is real work: int -> double conversions and
+     double multiply-adds.
+
+Q: How much additional performance from automatic vectorization?
+   - Total 1.09x (25.642 -> 23.604 ms). All of it is in grayscale (1.58x). Sobel: 1.00x,
+     because its machine code is byte-for-byte identical in both builds.
+
+Q: How much additional performance from -march=native?
+   - None measurable: total 23.604 -> 23.680 ms (0.3% slower, within run-to-run noise).
+     Grayscale 3.6% slower, Sobel 0.25% faster. Treat as "no change".
+
+------------------------------------------------------------------
+4.2 Generated Code Analysis (loop: sobel_row_ptr column loop)
+------------------------------------------------------------------
+Q: Significant differences between -O0 and -O3 (no-vec)?
+   Summary table in part_2_MC_register_allocation.txt:
+       -O0: ~511 instructions, ~172 loads, ~53 stores, 3 calls per pixel
+       -O3: 60 instructions, 27 loads, 1 store, 0 calls per pixel
+
+Q: At least two specific optimizations (pick any; each has its own file with excerpts):
+   1. Register allocation: stack variables -> registers (part_2_MC_register_allocation.txt)
+   2. Full loop unrolling of the 3x3 kernel loops (part_2_MC_loop_unrolling.txt)
+   3. Function inlining: gradient_magnitude + sqrt -> fsqrt, clamp -> csel
+      (part_2_MC_function_inlining.txt)
+   4. Strength reduction / induction variables / loop-invariant code motion: index math ->
+      pointer increments and immediate offsets (part_2_MC_strength_reduction.txt)
+   5. Instruction scheduling + multiply-add fusion (madd) (part_2_MC_instruction_scheduling.txt)
+   Strongest pair for a short answer: register allocation and inlining (biggest, easiest to
+   see), or unrolling and strength reduction (the most "loop" focused).
+
+Q: How do these explain the measured -O0 vs -O3 no-vec difference?
+   - Sobel: 8.5x fewer instructions per pixel (511 -> 60); measured time 8.63x faster
+     (~201 -> ~23 cycles/pixel). Instructions per cycle stayed about 2.5 in both builds, so
+     the speedup is almost exactly "the CPU executes 8.5x fewer instructions".
+   - The 60 instructions that remain are mostly real work: 27 data loads, 18 multiply-adds,
+     square/sqrt/clamp, and the store.
+
+Also worth mentioning (an optimization the compiler did NOT do; part_2_MC_missed_constant_propagation.txt):
+   The Gx/Gy kernels are still loaded from memory 18 times per pixel, and the zeros are still
+   multiplied, because the arrays are non-const globals and the uint8_t output store may
+   alias them.
+
+------------------------------------------------------------------
+4.3 Automatic Vectorization (part_3_MC_auto_vectorization.txt)
+------------------------------------------------------------------
+Q: Evidence of SIMD?
+   - grayscale_row_ptr grows from 28 to 196 instructions, 116 of them NEON. Key lines:
+         ld3  {v29.16b - v31.16b}, [x4], 48    // 16 BGR pixels split into B/G/R vectors
+         fmla v2.2d, v16.2d, v26.2d            // vector fused multiply-add
+         umin v22.8h, v22.8h, v24.8h           // vector clamp to 255
+         str  q22, [x3], 16                    // 16 gray bytes stored at once
+   - It processes 16 pixels per iteration, with a scalar loop for the leftover cols % 16.
+   - -O0 and -O3 no-vec listings contain zero NEON vector instructions.
+
+Q: Which portion benefits most?
+   - Grayscale: 5.526 -> 3.488 ms (1.58x). Sobel: unchanged.
+   - Why only 1.58x when it handles 16 pixels/iteration: gray_value() uses double
+     constants (0.0722, ...), so the math runs in 64-bit lanes, only 2 per register.
+     Most of the 116 instructions just widen bytes to double and narrow the results back.
+
+Q: An important loop that is not vectorized?
+   - The Sobel column loop (sobel_row_ptr, memory_pipelines.cpp:228). GCC's report
+     (g++ -O3 -fopt-info-vec-all):
+         memory_pipelines.cpp:228:22: missed: not vectorized: unsupported control flow in loop.
+     The control flow is sqrt()'s errno path: a branch to a real libm call for negative
+     input that stays inside the loop. GCC can't prove x*x + y*y >= 0, because int
+     arithmetic could overflow.
+   - The Lab 2 baseline loops are not vectorized either (g++ -O3 -fopt-info-vec-missed on
+     optimizations.cpp): grayscale_lab3's pixel loop (line 280) and sobel_lab3's (line 251)
+     both report "number of iterations cannot be computed". Their bound is
+     gray_frame->cols, re-read from the Mat on every iteration, because the pixel stores
+     through .at() could alias the Mat object itself.
+
+Q: How much of the total compiler improvement is SIMD?
+   - The compiler saved 200.753 - 23.604 = 177.1 ms/frame. SIMD accounts for
+     25.642 - 23.604 = 2.0 ms of it, about 1%. Non-SIMD optimization is the other ~99%.
+
+------------------------------------------------------------------
+4.4 -march=native (part_4_MC_march_native.txt)
+------------------------------------------------------------------
+Q: Measurable change?  No (23.604 vs 23.680 ms total; differences under 4% per stage, noise level).
+Q: Meaningful instruction differences?
+   - The target line changes (.arch armv8-a -> armv8.2-a+dotprod+crc+crypto+fp16+rcpc).
+   - The mnemonic counts are identical except mov (106 -> 109) and uxtw (5 -> 10). No new
+     ARMv8.2 instructions (no sdot/udot, no fp16). The changes are instruction order and
+     register choice from Cortex-A76 tuning.
+   - Why: the double grayscale math has no use for dot products or fp16, and the Sobel loop
+     isn't vectorized at all.
+Q: What does -march=native tell the compiler?
+   - "Assume every instruction set extension of the CPU doing the compile is available, and
+     tune for its pipeline" (like -march=<this cpu> -mtune=<this cpu>).
+Q: Why don't precompiled binaries use it?
+   - The binary would contain instructions that older or different CPUs don't have. On a Pi 4
+     (Cortex-A72, ARMv8.0, no dotprod), such an instruction is SIGILL (illegal instruction)
+     and the program crashes. Distributions target the common baseline (armv8-a). They use
+     run-time CPU detection with several compiled versions when they need newer instructions.
+
+------------------------------------------------------------------
+4.5 Lab 2 Baseline Comparison
+------------------------------------------------------------------
+Q: After both are -O3, how much of the source-level improvement remains?
+   - Current is still 2.08x faster in total (48.996 -> 23.604 ms): 3.29x in grayscale, 1.87x
+     in Sobel. The source improvements did not disappear.
+   - (To state what fraction remains, you also need the -O0 gap between Lab 2 and current.
+     That run was not part of the five; see section 5 for the command.)
+
+Q: Which source-level optimizations does the compiler reproduce or make unnecessary?
+   Things the compiler handled on its own (seen in the current code's -O3 assembly):
+   - Function call overhead: gradient_magnitude/sqrt are inlined. Writing the code inline by
+     hand would gain nothing.
+   - Index arithmetic and loop overhead: the compiler unrolls the 3x3 loops and turns indices
+     into pointer increments. Hand-unrolling or hand-written pointer math in the inner loop is
+     unnecessary.
+   - Keeping values in local variables vs re-reading: register allocation does it.
+   - Likely: much of .at() vs. row-pointer access. .at() is an inline template, so -O3 can
+     inline its address calculation. (In Lab 4 at -O0, row pointers were ~1.4x faster for
+     Sobel; this lab did not measure .at() alone at -O3, so say "likely".)
+
+Q: Which still give a measurable advantage?
+   - Not making a full copy of the frame: Lab 2 grayscale copies the RGB frame with copyTo
+     and Lab 2 sobel allocates and copies a whole frame on every call. The compiler can never
+     remove a library call that writes memory.
+   - One-channel output instead of writing gray 3 times: 1/3 of the bytes written, which the
+     compiler cannot change because it changes the data format.
+   - Computing Gx and Gy in one pass over the 3x3 window (9 reads) instead of two passes (18
+     reads of 3-byte Vec3b pixels, of which only one byte is used).
+   - Simple loop bounds (passing cols as an int): this is what let GCC vectorize the
+     current grayscale loop. The Lab 2 loops re-read gray_frame->cols and cannot be vectorized.
+   Measured result: grayscale 3.29x and Sobel 1.87x faster at the same -O3. This lab measured
+   the combined effect. It did not isolate each change, and the Lab 2 assembly was not
+   inspected instruction by instruction. Describe the individual items as the source
+   differences that explain the gap, and the vectorization point as confirmed by GCC's report.
+
+Q: Why can't/won't the compiler make those transformations?
+   - It must preserve behavior for all legal programs. It can't prove the output buffer
+     doesn't overlap Gx/Gy or the Mat object (char-type stores alias everything).
+   - It can't change data layout or the meaning of the output (3-channel vs 1-channel,
+     border policy). Those are program-design choices.
+   - It can't skip library calls with side effects (copyTo, new Mat allocation).
+   - It can't assume facts only the programmer knows: kernels never change, x*x + y*y never
+     overflows, frames are never empty.
+   - Floating point: it won't reorder or approximate math beyond what the flags allow.
+
+Q: Conclusions on programmer vs compiler roles?
+   - The compiler is very good at the low-level part: 7.8x without SIMD, mostly from register
+     allocation, inlining, unrolling, and address simplification. Hand-doing those is
+     wasted effort.
+   - The programmer owns what the compiler can't prove or isn't allowed to change: data
+     layout and data movement, avoiding copies/allocations, algorithm structure, and giving
+     the compiler information (const kernels, simple loop bounds, no aliasing, no error
+     paths in hot loops). Those choices still gave 2.08x at -O3, and they decide whether
+     auto-vectorization works at all.
+   - SIMD here was only ~1% of the compiler's total gain. Getting more from it depends on
+     source choices: fixed-point or float instead of double, and a Sobel loop without the
+     sqrt error path.
+
+
+==================================================================
+5. Caveats and things NOT measured
+==================================================================
+- Output is not bit-identical at -O3. On the capture frame, a few pixels differ by 1 gray
+  level: 1 of 2.07M pixels at 1080p and 22 of 8.3M at 4K. Sobel inherits them (3 and 101
+  pixels, max diff 2 and 4). Cause: FMA contraction of the double grayscale math (section 2).
+  Confirmed by a separate build with -ffp-contract=off that matched -O0 exactly (not one of
+  the five measured runs). The Lab 2 baseline at -O3 shows exactly the same differences,
+  because it has the same arithmetic. This is worth a sentence in the report: -O3 is allowed
+  to change floating-point rounding unless you forbid it.
+- Not measured: Lab 2 baseline at -O0. Part 5 only compares at -O3, as the handout asks.
+  To quantify "how much of the -O0 improvement remains", run (output not saved by make):
+      ./video_driver_O0 lab5 ../bbb_sunflower_2160p_60fps_normal.mp4 lab2
+- Not measured: the streaming pipeline under -O3 (it can't report grayscale and Sobel
+  separately).
+- Noise: medians of 360 frames are stable; treat differences under ~4% (e.g. -march=native)
+  as no change.
+- The Lab 2 baseline includes the Gy col_idx fix. The original code read past the end of Gy
+  (undefined behavior), so timing it at -O3 would not be meaningful.
+- The current implementation's arithmetic is exactly the Lab 2/3 baseline arithmetic (double
+  BT.709, sqrt magnitude). The Lab 3 fixed-point/approximate versions (grayscale_fixed,
+  sobel_approx) were not part of Lab 4 and are not measured here.
+
+
+==================================================================
+6. Map of the output files / how to regenerate
+==================================================================
+outputs/lab5_summary.md                         the combined results table (all parts)
+outputs/part1_O0.txt                            -O0 run, all resolutions + reference captures
+outputs/part1_O3_novec.txt                      -O3 no-vec run
+outputs/part3_O3.txt                            -O3 run
+outputs/part4_O3_native.txt                     -O3 -march=native run
+outputs/part5_lab2_O3.txt                       Lab 2 baseline, -O3
+outputs/part_2_MC_*.txt                         Part 2 assembly excerpts, one optimization each
+outputs/part_3_MC_auto_vectorization.txt        Part 3 SIMD evidence + GCC's vectorizer report
+outputs/part_4_MC_march_native.txt              Part 4 instruction comparison
+outputs/asm/memory_pipelines_<build>.s          full assembly listings
+captures/lab5_<build>_<impl>_{gray,sobel}_<res>.png   output images of frame 179
+
+make lab5            build everything, run all 5 runs, assembly, summary (~12 min on the Pi 5)
+make lab5_part1      only Part 1 (must run first: writes the -O0 reference captures)
+make lab5_part2      only the assembly listings
+make lab5_summary    rebuild the summary table from existing outputs
+make lab5 LAB5_SUMMARY_RES=3840x2160    summary table at another resolution

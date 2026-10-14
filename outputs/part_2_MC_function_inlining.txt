@@ -1,0 +1,86 @@
+==================================================================
+Part 2: Generated Machine Code - Function Inlining (gradient_magnitude + sqrt)
+==================================================================
+Loop: sobel_row_ptr() column loop (memory_pipelines.cpp)
+Build A: -O0                                                outputs/asm/memory_pipelines_O0.s, lines 124-160, 650-657
+Build B: -O3 -fno-tree-loop-vectorize -fno-tree-slp-vectorize   outputs/asm/memory_pipelines_O3_novec.s, lines 516-533, 557-566
+
+Source:
+
+    sobel_row[c] = gradient_magnitude(x_acc, y_acc);
+
+    uint8_t gradient_magnitude(int x_acc, int y_acc){
+        int final_mag = (x_acc * x_acc) + (y_acc * y_acc);
+        final_mag = sqrt(final_mag);
+        if(final_mag > 255){final_mag = 255;}
+        return final_mag;
+    }
+
+What changed
+------------
+At -O0 every output pixel makes three calls: sobel_row_ptr -> gradient_magnitude ->
+std::sqrt<int> (the libstdc++ template for an integer argument) -> sqrt in libm. Each call
+pays for argument setup, a frame push/pop (stp/ldp x29, x30), and spilling its arguments
+to the stack.
+
+-O0, call site in the column loop (lines 653-657):
+
+    ldr     w1, [sp, 120]       // y_acc
+    ldr     w0, [sp, 124]       // x_acc
+    bl      _Z18gradient_magnitudeii
+    and     w0, w0, 255
+    strb    w0, [x19]
+
+-O0, inside gradient_magnitude (lines 127-152):
+
+    stp     x29, x30, [sp, -48]!
+    mov     x29, sp
+    str     w0, [sp, 28]
+    str     w1, [sp, 24]
+    ldr     w0, [sp, 28]
+    mul     w1, w0, w0
+    ldr     w0, [sp, 24]
+    mul     w0, w0, w0
+    add     w0, w1, w0
+    str     w0, [sp, 44]
+    ldr     w0, [sp, 44]
+    bl      _ZSt4sqrtIiEN9__gnu_cxx11__enable_ifIXsrSt12__is_integerIT_E7__valueEdE6__typeES3_
+    fmov    d31, d0
+    fcvtzs  w0, d31
+    str     w0, [sp, 44]
+    ldr     w0, [sp, 44]
+    cmp     w0, 255             // if(final_mag > 255) is a real branch
+    ble     .L6
+    mov     w0, 255
+    str     w0, [sp, 44]
+    .L6:
+    ...
+
+At -O3 gradient_magnitude is inlined into the loop, and sqrt becomes the hardware fsqrt
+instruction. The libm call is kept only on a path that is never taken (a negative argument,
+which needs errno set; x*x + y*y is never negative here). The bound check becomes a
+branch-free conditional select.
+
+-O3, inlined gradient magnitude (lines 516-520, 559-566):
+
+    mul     w1, w1, w1          // one accumulator squared
+    madd    w0, w0, w0, w1      // + the other squared (x*x + y*y in one fused op)
+    scvtf   d0, w0              // int -> double
+    fcmp    d0, #0.0
+    bpl     .L61                // always taken: argument >= 0
+    ...                         // (lines 521-532: bl sqrt, never executed)
+    .L61:
+    fsqrt   d0, d0              // sqrt in one instruction, no call
+    ...
+    fcvtzs  w0, d0
+    cmp     w0, 255
+    csel    w0, w0, w26, le     // min(final_mag, 255) without a branch
+    strb    w0, [x24], 1        // sobel_row[c] = ..., pointer post-increment
+
+How it helps performance
+------------------------
+Inlining removes three calls and returns, three frame setups, and the argument spills per
+pixel, about 35 instructions plus libm's own sqrt. Calls also block optimization: once the
+body is inline, the compiler can keep x_acc/y_acc in registers across it, fuse the square
+and add into madd, and replace the 255 clamp branch with csel. That removes a branch the
+predictor would have to guess on every pixel near strong edges.

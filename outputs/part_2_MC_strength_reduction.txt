@@ -1,0 +1,87 @@
+==================================================================
+Part 2: Generated Machine Code - Strength Reduction / Induction Variables (address math)
+==================================================================
+Loop: sobel_row_ptr() column loop (memory_pipelines.cpp)
+Build A: -O0                                                outputs/asm/memory_pipelines_O0.s, lines 566-576, 594-631
+Build B: -O3 -fno-tree-loop-vectorize -fno-tree-slp-vectorize   outputs/asm/memory_pipelines_O3_novec.s, lines 449-467, 471-535
+
+Source:
+
+    const uint8_t* window[3] = {above, current, below};
+    ...
+    pixel = window[a][c + b - 1];
+    x_acc += (pixel * Gx[a][b]);
+    y_acc += (pixel * Gy[a][b]);
+
+What changed
+------------
+At -O0 every tap recomputes each address from scratch: it loads window[a] from a stack array,
+computes c + b - 1, sign-extends it, and adds. Gx[a][b] and Gy[a][b] are each rebuilt as
+base + a*3 + b, with the a*3 done as a shift and add. The window[] array is built in memory
+first (lines 571-576).
+
+-O0, address of window[a][c + b - 1] (lines 594-604):
+
+    ldrsw   x0, [sp, 112]       // a
+    lsl     x0, x0, 3           // a * sizeof(pointer)
+    add     x1, sp, 80          // &window[0]
+    ldr     x1, [x1, x0]        // window[a]
+    ldr     w2, [sp, 116]       // c
+    ldr     w0, [sp, 108]       // b
+    add     w0, w2, w0          // c + b
+    sxtw    x0, w0
+    sub     x0, x0, #1          // c + b - 1
+    add     x0, x1, x0
+    ldrb    w0, [x0]            // pixel
+
+-O0, address of Gx[a][b] (lines 607-616; Gy repeats the same 10 instructions, lines 622-631):
+
+    adrp    x0, Gx
+    add     x4, x0, :lo12:Gx    // &Gx, rebuilt every tap
+    ldrsw   x3, [sp, 108]       // b
+    ldrsw   x1, [sp, 112]       // a
+    mov     x0, x1
+    lsl     x0, x0, 1
+    add     x0, x0, x1          // a * 3
+    add     x0, x4, x0
+    add     x0, x0, x3          // + b
+    ldrsb   w0, [x0]            // Gx[a][b]
+
+At -O3 the compiler sees that every address is a linear function of the loop counters.
+- The window[] array disappears; above/current/below are just three registers (x21, x23, x22).
+- c is replaced by the pointers themselves: each row pointer goes up by 1 per pixel instead
+  of recomputing base + c.
+- The Gx/Gy base addresses are computed once before the loop (loop-invariant code motion).
+- Every (a, b) offset becomes an immediate in the load instruction.
+
+-O3, setup once before the loop (lines 454-467):
+
+    adrp    x20, Gx
+    adrp    x19, Gy
+    add     x20, x20, :lo12:Gx  // &Gx, hoisted out of the loop
+    add     x19, x19, :lo12:Gy  // &Gy, hoisted out of the loop
+    mov     x21, x0             // above
+    mov     x22, x2             // below
+    mov     x23, x1             // current
+    add     x24, x3, 1          // &sobel_row[1]
+
+-O3, every address in the loop is "register + constant" (examples from lines 471-511):
+
+    ldrb    w7, [x21, 1]        // above[c]     -- was 11 instructions at -O0
+    ldrsb   w0, [x19, 1]        // Gy[0][1]     -- was 10 instructions at -O0
+    ldrsb   w0, [x20, 8]        // Gx[2][2]
+    ...
+    add     x21, x21, 1         // above++   (induction variables replace c)
+    add     x23, x23, 1         // current++
+    add     x22, x22, 1         // below++
+    strb    w0, [x24], 1        // sobel_row[c] = ..., then sobel_row++ (post-increment)
+    cmp     x21, x25            // x25 = above + cols - 2 (computed once, lines 449-450)
+    bne     .L60
+
+How it helps performance
+------------------------
+At -O0 address arithmetic is most of the work: 28 of the 48 instructions in each tap
+only build the three addresses (pixel, Gx, Gy). At -O3 it costs nothing extra, because AArch64
+loads take "base + immediate" directly, so the address math disappears into the load
+instruction. Per pixel, the remaining address work is three pointer increments and one
+compare.

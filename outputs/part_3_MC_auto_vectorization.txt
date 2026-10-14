@@ -1,0 +1,98 @@
+==================================================================
+Part 3: Generated Machine Code - Automatic Vectorization (NEON / Advanced SIMD)
+==================================================================
+Build A: -O3 -fno-tree-loop-vectorize -fno-tree-slp-vectorize   outputs/asm/memory_pipelines_O3_novec.s
+Build B: -O3                                                     outputs/asm/memory_pipelines_O3.s
+Target: Raspberry Pi 5 (Cortex-A76, AArch64). SIMD on this CPU is NEON: 128-bit v0-v31
+        registers. A suffix gives the lane layout: .16b = 16 bytes, .8h = 8 x 16-bit,
+        .4s = 4 x 32-bit, .2d = 2 x 64-bit double.
+
+Per-function instruction counts (from the listings)
+---------------------------------------------------
+| Function | -O3 no-vec | -O3 | NEON instructions at -O3 | Vectorized? |
+|----------|------------|-----|--------------------------|-------------|
+| grayscale_row_ptr (grayscale loop) | 28 | 196 | 116 | yes, 16 pixels per iteration + scalar tail |
+| grayscale_ptr (row_ptr inlined) | 55 | 223 | 116 | yes (same loop, inlined) |
+| sobel_row_ptr (Sobel loop) | 114 | 114 | 0 | NO, identical code in both builds |
+| sobel_ptr | 78 | 78 | 0 | NO |
+
+Evidence: grayscale is vectorized
+---------------------------------
+-O3 no-vec, grayscale_row_ptr: one pixel per iteration, scalar double math
+(memory_pipelines_O3_novec.s, lines 408-425):
+
+    .L53:
+    ldrb    w4, [x0, 1]         // green
+    add     x0, x0, 3
+    ldrb    w3, [x0, -3]        // blue
+    ldrb    w2, [x0, -1]        // red
+    scvtf   d27, w4             // int -> double, one value
+    scvtf   d0, w3
+    scvtf   d28, w2
+    fmul    d27, d27, d31       // green * 0.7152
+    fmadd   d27, d0, d30, d27   // + blue * 0.0722
+    fmadd   d28, d28, d29, d27  // + red * 0.2126
+    fcvtzu  w2, d28
+    ...
+    strb    w2, [x1], 1         // one gray byte
+    cmp     x5, x1
+    bne     .L53
+
+-O3, grayscale_row_ptr: 16 pixels per iteration (memory_pipelines_O3.s, lines 422-535):
+
+    .L54:
+    ld3     {v29.16b - v31.16b}, [x4], 48   // 16 BGR pixels, de-interleaved into
+                                            // B, G, R vectors in one instruction
+    zip1    v30.16b, v30.16b, v28.16b       // widen bytes -> 16-bit -> 32-bit ...
+    zip1    v6.8h, v30.8h, v28.8h
+    sxtl    v2.2d, v5.2s                    // ... -> 64-bit, 2 lanes per register
+    scvtf   v2.2d, v2.2d                    // int -> double, 2 at a time
+    fmul    v2.2d, v2.2d, v27.2d            // channel * coefficient, 2 lanes
+    fmla    v2.2d, v16.2d, v26.2d           // fused multiply-add, 2 lanes
+    fmla    v2.2d, v23.2d, v25.2d
+    ...
+    fcvtzs  v2.2d, v2.2d                    // double -> int, 2 lanes
+    uzp1    v5.4s, v2.4s, v5.4s             // narrow back down 64 -> 32 -> 16 bits
+    uzp1    v22.8h, v5.8h, v22.8h
+    umin    v22.8h, v22.8h, v24.8h          // gray > 255 ? 255 : gray, 8 lanes
+    uzp1    v22.16b, v30.16b, v22.16b       // -> 16 gray bytes
+    str     q22, [x3], 16                   // store 16 gray pixels at once
+    cmp     x5, x3
+    bne     .L54
+    ...                                     // .L56: scalar loop for the last cols % 16
+
+Note the limit: gray_value() multiplies by double constants (0.0722, 0.7152, 0.2126), so the
+math runs in 64-bit lanes and a 128-bit register holds only 2 values. Most of the 116 NEON
+instructions widen the bytes up to double and narrow the results back down. The loop
+handles 16 pixels per iteration, but the actual arithmetic is only 2-wide.
+
+Evidence: Sobel is NOT vectorized
+---------------------------------
+sobel_row_ptr is instruction-for-instruction identical in the two builds (114 instructions,
+0 NEON); see part_2_MC_*.txt for the listing. GCC's own vectorizer report says why
+(g++ -O3 -fopt-info-vec-all, memory_pipelines.cpp line 228 = the Sobel column loop):
+
+    memory_pipelines.cpp:228:22: missed: couldn't vectorize loop
+    memory_pipelines.cpp:228:22: missed: not vectorized: unsupported control flow in loop.
+
+The control flow is sqrt()'s error path. For a negative argument sqrt must set errno, so GCC
+keeps a branch to a real libm call inside the loop (fcmp / bpl, then bl sqrt, lines 518-532).
+The vectorizer cannot handle a loop with that branch and call. The argument (x*x + y*y) is
+never negative, but the compiler cannot prove it: in int arithmetic the sum could overflow.
+Other things that would get in the way even without the branch:
+1. The 18 Gx/Gy coefficients are reloaded every pixel, because the uint8_t store to
+   sobel_row may alias them (part_2_MC_missed_constant_propagation.txt).
+2. int -> double -> sqrt -> int for the magnitude. NEON has fsqrt v.2d, but it is only 2 lanes
+   wide, like grayscale.
+
+Measured effect (1920x1080, ms/frame, outputs/part1_O3_novec.txt vs outputs/part3_O3.txt)
+------------------------------------------------------------------------------------------
+| Stage | -O3 no-vec | -O3 | Speedup from vectorization |
+|-------|------------|-----|----------------------------|
+| Grayscale | 5.526 | 3.488 | 1.58x |
+| Sobel | 20.116 | 20.116 | 1.00x (same machine code) |
+| Total | 25.642 | 23.604 | 1.09x |
+
+All of the SIMD gain is in grayscale. Sobel is about 85% of the -O3 time and gets nothing,
+so the total improves only 9%. SIMD accounts for 25.642 - 23.604 = 2.0 ms of the
+200.753 - 23.604 = 177.1 ms the compiler saved vs -O0 at this resolution (about 1%).

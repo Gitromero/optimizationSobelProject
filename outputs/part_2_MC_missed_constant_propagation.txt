@@ -1,0 +1,62 @@
+==================================================================
+Part 2: Generated Machine Code - Missed Optimization: Constant Propagation of Gx / Gy
+==================================================================
+Loop: sobel_row_ptr() column loop (memory_pipelines.cpp)
+Build A: -O0                                                outputs/asm/memory_pipelines_O0.s, lines 607-631
+Build B: -O3 -fno-tree-loop-vectorize -fno-tree-slp-vectorize   outputs/asm/memory_pipelines_O3_novec.s, lines 470-515
+
+Source (video_driver.hpp):
+
+    inline int8_t Gx[3][3] = {{-1, 0, 1}, {-2, 0, 2}, {-1, 0, 1}};
+    inline int8_t Gy[3][3] = {{1, 2, 1}, {0, 0, 0}, {-1, -2, -1}};
+
+What did NOT change
+-------------------
+The kernels are always the same numbers, but they are declared as ordinary (non-const)
+global variables. Even at -O3 the compiler still loads all 18 coefficients from memory for
+every output pixel and multiplies by every one of them, including the six zeros (Gx's middle
+column and Gy's middle row). Multiplying by 1, -1, 2, and -2 is also left as a real multiply
+instead of an add, subtract, or shift.
+
+-O3, the coefficient loads are inside the column loop (.L60), once per pixel (lines 472-511):
+
+    ldrsb   w0, [x19, 1]        // Gy[0][1] = 2
+    ldrsb   w5, [x20, 1]        // Gx[0][1] = 0  -> multiply by zero still executed
+    ldrsb   w6, [x19]           // Gy[0][0] = 1
+    ldrsb   w2, [x19, 2]
+    ldrsb   w1, [x20]
+    ldrsb   w7, [x19, 3]        // Gy[1][0] = 0
+    ldrsb   w0, [x20, 2]
+    ...                         // 18 ldrsb in total per pixel
+    ldrsb   w0, [x20, 8]        // Gx[2][2] = 1
+
+-O3, the multiplies by those loaded values (lines 477-515, 2 mul + 16 madd per pixel):
+
+    mul     w0, w0, w7
+    mul     w5, w5, w7          // pixel * Gx[0][1] (= 0)
+    madd    w6, w6, w9, w0
+    ...
+
+If the coefficients were known constants, the 3x3 Sobel collapses to 12 non-zero terms, with
+the 1/2 weights done as add and shift:
+
+    Gx = (above[c+1] - above[c-1]) + 2*(current[c+1] - current[c-1]) + (below[c+1] - below[c-1])
+    Gy = (above[c-1] + 2*above[c] + above[c+1]) - (below[c-1] + 2*below[c] + below[c+1])
+
+That would be about 10 add/sub/shift instructions instead of 18 loads + 18 multiplies.
+
+Why the compiler cannot do it
+-----------------------------
+1. Gx and Gy are not const. They have external linkage (inline variables in a header), so
+   any other function in the program is allowed to change them, and the compiler has to
+   read their current values.
+2. They cannot even be loaded once before the loop. The loop stores through
+   uint8_t* sobel_row, and a char-type pointer may alias any object, including Gx and Gy (both
+   int8_t). As far as the compiler can prove, the store to sobel_row[c] could have changed a
+   coefficient, so all 18 are reloaded after every store.
+
+Both are the programmer's information, not the compiler's: we know the kernels never change
+and the output never overlaps them. Declaring them const / constexpr (or copying them into
+local constants) would give the compiler that information. The source was intentionally left
+unchanged for Lab 5, so every build measures the same code. This is a case where a
+source-level change still matters at -O3.

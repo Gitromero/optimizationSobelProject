@@ -1,0 +1,43 @@
+Input: ../bbb_sunflower_2160p_60fps_normal.mp4 (3840x2160), frames 60-179 (120 frames = 2.00 s of video at 60.00 fps), scaled with cv::resize(INTER_AREA) before timing
+==================================================================
+Lab 5: Compiler Optimization (-O0, current implementation)
+==================================================================
+Build: -O0, single thread, no SIMD intrinsics
+Timed region: grayscale + Sobel calls only (std::chrono::steady_clock). Excluded: video decode, resize, buffer allocation, comparisons, PNG writes.
+Samples: 120 frames x 3 repeats per implementation (+1 untimed warmup); median per-frame time reported.
+Time per pixel = median frame time / (width * height).
+
+Implementation: Lab 4 full-frame row-pointer pipeline (grayscale_ptr / sobel_ptr): single-channel gray frame, row pointers, row-major
+
+| Resolution | Pixels | Gray ms/frame | Sobel ms/frame | Total ms/frame | ns/pixel | FPS |
+|------------|--------|---------------|----------------|----------------|----------|-----|
+| 320x180 | 57600 | 0.742 | 4.815 | 5.557 | 96.483 | 179.94 |
+| 640x360 | 230400 | 2.978 | 19.315 | 22.294 | 96.762 | 44.86 |
+| 1280x720 | 921600 | 11.918 | 77.198 | 89.169 | 96.755 | 11.21 |
+| 1920x1080 | 2073600 | 27.297 | 173.547 | 200.753 | 96.814 | 4.98 |
+| 3840x2160 | 8294400 | 110.042 | 692.924 | 802.950 | 96.806 | 1.25 |
+
+Correctness (frame 179, vs. the -O0 build of the current implementation):
+| Resolution | Comparison | Differing pixels | Max abs diff | Bit-identical |
+|------------|------------|------------------|--------------|---------------|
+| 320x180 | Gray + Sobel saved as the -O0 reference | - | - | - |
+| 640x360 | Gray + Sobel saved as the -O0 reference | - | - | - |
+| 1280x720 | Gray + Sobel saved as the -O0 reference | - | - | - |
+| 1920x1080 | Gray + Sobel saved as the -O0 reference | - | - | - |
+| 3840x2160 | Gray + Sobel saved as the -O0 reference | - | - | - |
+
+Saved images from frame 179:
+  captures/lab5_O0_current_gray_320x180.png
+  captures/lab5_O0_current_sobel_320x180.png
+  captures/lab5_O0_current_gray_640x360.png
+  captures/lab5_O0_current_sobel_640x360.png
+  captures/lab5_O0_current_gray_1280x720.png
+  captures/lab5_O0_current_sobel_1280x720.png
+  captures/lab5_O0_current_gray_1920x1080.png
+  captures/lab5_O0_current_sobel_1920x1080.png
+  captures/lab5_O0_current_gray_3840x2160.png
+  captures/lab5_O0_current_sobel_3840x2160.png
+
+All outputs bit-identical: n/a (this run is the reference)
+
+Run time: 416.6 s total (10.7 s decoding + scaling 120 frames, 405.9 s benchmarking, verifying, and saving captures)

@@ -6,9 +6,8 @@ video_driver_*
 *.o
 *.out
 
-# Generated run artifacts (output2/ is the kept results set)
+# Generated run artifacts
 captures/
-outputs/
 
 # Images
 *.png

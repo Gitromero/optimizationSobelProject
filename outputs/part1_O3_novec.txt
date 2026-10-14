@@ -1,0 +1,49 @@
+Input: ../bbb_sunflower_2160p_60fps_normal.mp4 (3840x2160), frames 60-179 (120 frames = 2.00 s of video at 60.00 fps), scaled with cv::resize(INTER_AREA) before timing
+==================================================================
+Lab 5: Compiler Optimization (-O3 -fno-tree-loop-vectorize -fno-tree-slp-vectorize, current implementation)
+==================================================================
+Build: -O3 -fno-tree-loop-vectorize -fno-tree-slp-vectorize, single thread, no SIMD intrinsics
+Timed region: grayscale + Sobel calls only (std::chrono::steady_clock). Excluded: video decode, resize, buffer allocation, comparisons, PNG writes.
+Samples: 120 frames x 3 repeats per implementation (+1 untimed warmup); median per-frame time reported.
+Time per pixel = median frame time / (width * height).
+
+Implementation: Lab 4 full-frame row-pointer pipeline (grayscale_ptr / sobel_ptr): single-channel gray frame, row pointers, row-major
+
+| Resolution | Pixels | Gray ms/frame | Sobel ms/frame | Total ms/frame | ns/pixel | FPS |
+|------------|--------|---------------|----------------|----------------|----------|-----|
+| 320x180 | 57600 | 0.153 | 0.556 | 0.710 | 12.328 | 1408.24 |
+| 640x360 | 230400 | 0.615 | 2.239 | 2.858 | 12.406 | 349.85 |
+| 1280x720 | 921600 | 2.464 | 8.956 | 11.421 | 12.393 | 87.56 |
+| 1920x1080 | 2073600 | 5.526 | 20.116 | 25.642 | 12.366 | 39.00 |
+| 3840x2160 | 8294400 | 22.071 | 80.638 | 102.709 | 12.383 | 9.74 |
+
+Correctness (frame 179, vs. the -O0 build of the current implementation):
+| Resolution | Comparison | Differing pixels | Max abs diff | Bit-identical |
+|------------|------------|------------------|--------------|---------------|
+| 320x180 | Grayscale vs captures/lab5_O0_current_gray_320x180.png | 0 | 0 | yes |
+| 320x180 | Sobel vs captures/lab5_O0_current_sobel_320x180.png | 0 | 0 | yes |
+| 640x360 | Grayscale vs captures/lab5_O0_current_gray_640x360.png | 0 | 0 | yes |
+| 640x360 | Sobel vs captures/lab5_O0_current_sobel_640x360.png | 0 | 0 | yes |
+| 1280x720 | Grayscale vs captures/lab5_O0_current_gray_1280x720.png | 0 | 0 | yes |
+| 1280x720 | Sobel vs captures/lab5_O0_current_sobel_1280x720.png | 0 | 0 | yes |
+| 1920x1080 | Grayscale vs captures/lab5_O0_current_gray_1920x1080.png | 1 | 1 | NO |
+| 1920x1080 | Sobel vs captures/lab5_O0_current_sobel_1920x1080.png | 3 | 2 | NO |
+| 3840x2160 | Grayscale vs captures/lab5_O0_current_gray_3840x2160.png | 22 | 1 | NO |
+| 3840x2160 | Sobel vs captures/lab5_O0_current_sobel_3840x2160.png | 101 | 4 | NO |
+
+Saved images from frame 179:
+  captures/lab5_O3_novec_current_gray_320x180.png
+  captures/lab5_O3_novec_current_sobel_320x180.png
+  captures/lab5_O3_novec_current_gray_640x360.png
+  captures/lab5_O3_novec_current_sobel_640x360.png
+  captures/lab5_O3_novec_current_gray_1280x720.png
+  captures/lab5_O3_novec_current_sobel_1280x720.png
+  captures/lab5_O3_novec_current_gray_1920x1080.png
+  captures/lab5_O3_novec_current_sobel_1920x1080.png
+  captures/lab5_O3_novec_current_gray_3840x2160.png
+  captures/lab5_O3_novec_current_sobel_3840x2160.png
+
+All outputs bit-identical: NO
+Note: every build compiles the same source, so these differences come from the compiler's code generation, not from the implementation.
+
+Run time: 63.2 s total (11.0 s decoding + scaling 120 frames, 52.2 s benchmarking, verifying, and saving captures)

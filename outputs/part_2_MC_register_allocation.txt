@@ -1,0 +1,80 @@
+==================================================================
+Part 2: Generated Machine Code - Register Allocation
+==================================================================
+Loop: sobel_row_ptr() column loop (memory_pipelines.cpp), the Sobel stage of the current
+      implementation and the most expensive loop in the program (Sobel is ~86% of the -O0
+      grayscale + Sobel time, see outputs/part1_O0.txt).
+Build A: -O0                                                outputs/asm/memory_pipelines_O0.s, lines 556-682
+Build B: -O3 -fno-tree-loop-vectorize -fno-tree-slp-vectorize   outputs/asm/memory_pipelines_O3_novec.s, lines 435-594
+Target: Raspberry Pi 5 (Cortex-A76, AArch64), g++ 14.2.0
+
+Source (inner 3x3 neighborhood of one output pixel):
+
+    for(int a = 0; a < 3; a++){
+        for(int b = 0; b < 3; b++){
+            pixel = window[a][c + b - 1];
+            x_acc += (pixel * Gx[a][b]);
+            y_acc += (pixel * Gy[a][b]);
+        }
+    }
+
+What changed
+------------
+At -O0 every local variable lives in the stack frame. Every use reloads it and every
+assignment stores it back: c is [sp, 116], a is [sp, 112], b is [sp, 108], pixel is [sp, 107],
+y_acc is [sp, 120], x_acc is [sp, 124], and the window[] row pointers are [sp, 80..96].
+
+-O0, accumulating one tap into x_acc (lines 617-620):
+
+    mul     w0, w2, w0
+    ldr     w1, [sp, 124]       // load x_acc from the stack
+    add     w0, w1, w0
+    str     w0, [sp, 124]       // store x_acc back to the stack
+
+-O0, incrementing b and testing the loop condition (lines 636-642):
+
+    ldr     w0, [sp, 108]       // load b
+    add     w0, w0, 1
+    str     w0, [sp, 108]       // store b
+    ldr     w0, [sp, 108]       // load b again for the compare
+    cmp     w0, 2
+    ble     .L44
+
+-O0, even the pixel just loaded is written to the stack and read back (lines 604-606):
+
+    ldrb    w0, [x0]            // pixel = window[a][c + b - 1]
+    strb    w0, [sp, 107]       // store pixel
+    ldrb    w2, [sp, 107]       // reload pixel for the Gx multiply
+
+At -O3 every value is in a register for the whole loop: x21/x23/x22 are the above/current/below
+row pointers, x24 the output pointer, x20/x19 the Gx/Gy base addresses, and the x/y
+accumulators are kept in w0-w11. The only memory traffic left is the real data: 9 pixel
+loads, 18 kernel-coefficient loads (see part_2_MC_missed_constant_propagation.txt), and 1
+output store.
+
+-O3, the start of one output pixel (lines 470-477): loads go straight to registers and feed
+the arithmetic directly, with no stack slots:
+
+    .L60:
+    ldrb    w7, [x21, 1]        // above[c]
+    ldrsb   w0, [x19, 1]        // Gy[0][1]
+    ldrsb   w5, [x20, 1]        // Gx[0][1]
+    ldrb    w9, [x21]           // above[c-1]
+    ldrsb   w6, [x19]           // Gy[0][0]
+    ldrb    w8, [x21, 2]        // above[c+1]
+    mul     w0, w0, w7
+
+Per output pixel (fast path, counted from the listings)
+-------------------------------------------------------
+| Build | Instructions | Loads | Stores | Calls |
+|-------|--------------|-------|--------|-------|
+| -O0 | ~511 (9 x 48 per tap + loop overhead + gradient_magnitude + std::sqrt<int>) | ~172 | ~53 | 3 (gradient_magnitude, std::sqrt<int>, sqrt) |
+| -O3, vectorization disabled | 60 | 27 | 1 | 0 |
+
+How it helps performance
+------------------------
+Each stack round trip turns a 1-cycle register operation into a store, then a load that has to
+wait on that store, and back-to-back iterations become chained through memory (x_acc's
+store -> load -> add -> store). Removing ~145 loads and ~52 stores per pixel cuts both the
+instruction count and the long dependency chains. This is the biggest single reason the
+Sobel stage is so much faster at -O3.

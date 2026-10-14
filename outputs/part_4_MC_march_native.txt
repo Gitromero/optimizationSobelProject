@@ -1,0 +1,72 @@
+==================================================================
+Part 4: Generated Machine Code - -march=native
+==================================================================
+Build A: -O3                       outputs/asm/memory_pipelines_O3.s
+Build B: -O3 -march=native         outputs/asm/memory_pipelines_O3_native.s
+Target: Raspberry Pi 5 (Cortex-A76), g++ 14.2.0
+
+What -march=native told the compiler
+------------------------------------
+The first line of each listing shows the target architecture GCC assumed:
+
+    -O3:                .arch armv8-a
+    -O3 -march=native:  .arch armv8.2-a+dotprod+crc+crypto+fp16+rcpc
+
+Without -march, GCC on Debian arm64 targets the original ARMv8.0-A, which runs on every 64-bit
+ARM chip (including the Pi 3 and Pi 4). With -march=native, GCC reads this CPU's features and
+may use ARMv8.2 instructions (e.g. sdot/udot 8-bit dot products, half-precision fp16 math,
+rcpc loads). It also tunes instruction scheduling for the Cortex-A76 pipeline (as if
+-mtune=cortex-a76).
+
+What actually changed
+---------------------
+Instruction mix for the whole file (every mnemonic counted in both listings):
+
+| Instruction | -O3 | -O3 -march=native |
+|-------------|-----|-------------------|
+| mov | 106 | 109 |
+| uxtw (operand extend) | 5 | 10 |
+| every other mnemonic | same count | same count |
+| total | 1577 | 1585 |
+
+No new instruction appears: no sdot/udot, no fp16, nothing from ARMv8.1/8.2. The hot loops
+(grayscale_row_ptr 196 vs 197, sobel_row_ptr 114 vs 114 instructions) use the same
+instructions; native only changes their order and register choice. For example, gray_value
+(lines 14-34 in both listings; the same 21 instructions, reordered):
+
+    -O3                                     -O3 -march=native
+    and     w1, w1, 255                     adrp    x3, .LC0                <- constant address first
+    and     w0, w0, 255                     and     w1, w1, 255
+    adrp    x3, .LC0                        and     w0, w0, 255
+    and     w2, w2, 255                     and     w2, w2, 255
+    scvtf   d1, w1                          ldr     d0, [x3, #:lo12:.LC0]   <- coefficient load earlier
+    scvtf   d31, w0                         scvtf   d1, w1
+    adrp    x0, .LC1                        adrp    x3, .LC1
+    ldr     d0, [x3, #:lo12:.LC0]           scvtf   d31, w0
+    scvtf   d30, w2                         adrp    x0, .LC2
+    mov     w1, 255                         scvtf   d30, w2
+    ldr     d28, [x0, #:lo12:.LC1]          ldr     d28, [x3, #:lo12:.LC1]
+    adrp    x0, .LC2                        mov     w3, 255
+    fmul    d0, d1, d0                      ldr     d29, [x0, #:lo12:.LC2]
+    ldr     d29, [x0, #:lo12:.LC2]          fmul    d0, d1, d0
+    fmadd   d28, d31, d28, d0               fmadd   d28, d31, d28, d0
+    fmadd   d29, d30, d29, d28              fmadd   d29, d30, d29, d28
+    fcvtzu  w0, d29                         fcvtzu  w0, d29
+    ...                                     ...
+
+Cortex-A76 tuning moves the loads earlier so their latency overlaps the integer work; the
+arithmetic is the same.
+
+Why: this code has no use for the new instructions. Grayscale is double-precision math (dot
+products and fp16 do not apply), and the Sobel loop is not vectorized at all (see
+part_3_MC_auto_vectorization.txt). The baseline ARMv8.0 NEON already has everything the
+vectorized grayscale loop uses.
+
+Why precompiled software does not use -march=native
+---------------------------------------------------
+A binary built with -march=native may contain instructions that only exist on the build
+machine's CPU. Run on an older or different CPU (e.g. a Pi 4's Cortex-A72, which is ARMv8.0
+with no dotprod), any such instruction crashes with SIGILL (illegal instruction).
+Distributions therefore build for the lowest common target (armv8-a here). If they need newer
+instructions, they detect the CPU at run time and choose between multiple compiled versions
+of a function.
